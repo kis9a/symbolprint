@@ -97,11 +97,11 @@ func main() {
 		}
 
 		for _, pkg := range pkgs {
-			spec, filePath, fset := findTypeSpec(pkg, funcOrTypeName)
-			if spec == nil {
+			node, filePath, fset := findTypeSpec(pkg, funcOrTypeName)
+			if node == nil {
 				continue
 			}
-			src, err := extractNodeSource(fset, filePath, spec)
+			src, err := extractNodeSource(fset, filePath, node)
 			if err != nil {
 				log.Printf("failed to extract type source of %q: %v\n", sym, err)
 				continue
@@ -314,7 +314,7 @@ func matchReceiverType(expr ast.Expr, typeName string, isPtr bool) bool {
 	return false
 }
 
-func findTypeSpec(pkg *packages.Package, typeName string) (spec *ast.TypeSpec, filePath string, fset *token.FileSet) {
+func findTypeSpec(pkg *packages.Package, typeName string) (node ast.Node, filePath string, fset *token.FileSet) {
 	for i, fAST := range pkg.Syntax {
 		fileName := pkg.CompiledGoFiles[i]
 		fset = pkg.Fset
@@ -330,7 +330,7 @@ func findTypeSpec(pkg *packages.Package, typeName string) (spec *ast.TypeSpec, f
 					continue
 				}
 				if ts.Name != nil && ts.Name.Name == typeName {
-					return ts, fileName, fset
+					return gd, fileName, fset
 				}
 			}
 		}
