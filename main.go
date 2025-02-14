@@ -23,6 +23,20 @@ type printOutput struct {
 	definitions []string
 }
 
+type functionKey struct {
+	funcName     string
+	receiverType string
+	isPtr        bool
+}
+
+type packageIndex struct {
+	pkg          *packages.Package
+	fileContents map[string][]byte
+	funcDecls    map[functionKey]*ast.FuncDecl
+	typeSpecs    map[string]*ast.GenDecl
+	fset         *token.FileSet
+}
+
 func main() {
 	formatFlag := flag.String("format", "plain", "output format: plain or markdown")
 	flag.Parse()
@@ -47,8 +61,8 @@ func main() {
 		log.Fatalf("failed to get absolute module root path: %v", err)
 	}
 
+	symbolsByPkg := make(map[string][]string)
 	printed := make(map[string]bool)
-	results := make(map[string]*printOutput)
 
 	for _, sym := range symbols {
 		if printed[sym] {
@@ -56,30 +70,32 @@ func main() {
 		}
 		printed[sym] = true
 
-		pkgPath, receiverType, isPtr, funcOrTypeName, err := parseSymbol(sym)
-		if err != nil {
-			log.Printf("skip symbol %q: %v\n", sym, err)
+		pkgPath, _, _, _, parseErr := parseSymbol(sym)
+		if parseErr != nil {
+			log.Printf("skip symbol %q: %v\n", sym, parseErr)
 			continue
 		}
+		symbolsByPkg[pkgPath] = append(symbolsByPkg[pkgPath], sym)
+	}
 
+	results := make(map[string]*printOutput)
+	for pkgPath, syms := range symbolsByPkg {
 		pkgs, err := loadPackages(absRoot, pkgPath)
 		if err != nil {
-			log.Printf("failed to load package %q for symbol %q: %v\n", pkgPath, sym, err)
+			log.Printf("failed to load package %q: %v\n", pkgPath, err)
 			continue
 		}
+		pkg := pkgs[0]
 
-		found := false
+		idx := buildPackageIndex(pkg)
 
-		for _, pkg := range pkgs {
-			decl, filePath, fset := findFuncDecl(pkg, receiverType, isPtr, funcOrTypeName)
-			if decl == nil {
-				continue
-			}
-			src, err := extractNodeSource(fset, filePath, decl)
+		for _, sym := range syms {
+			pkgPath, receiverType, isPtr, funcOrTypeName, err := parseSymbol(sym)
 			if err != nil {
-				log.Printf("failed to extract source of %q: %v\n", sym, err)
+				log.Printf("skip symbol %q: %v\n", sym, err)
 				continue
 			}
+
 			if _, ok := results[pkgPath]; !ok {
 				results[pkgPath] = &printOutput{
 					pkgName:     pkg.Name,
@@ -87,38 +103,32 @@ func main() {
 					definitions: []string{},
 				}
 			}
-			results[pkgPath].definitions = append(results[pkgPath].definitions, src)
-			found = true
-			break
-		}
 
-		if found {
-			continue
-		}
-
-		for _, pkg := range pkgs {
-			node, filePath, fset := findTypeSpec(pkg, funcOrTypeName)
-			if node == nil {
-				continue
+			fnKey := functionKey{
+				funcName:     funcOrTypeName,
+				receiverType: receiverType,
+				isPtr:        isPtr,
 			}
-			src, err := extractNodeSource(fset, filePath, node)
-			if err != nil {
-				log.Printf("failed to extract type source of %q: %v\n", sym, err)
-				continue
-			}
-			if _, ok := results[pkgPath]; !ok {
-				results[pkgPath] = &printOutput{
-					pkgName:     pkg.Name,
-					pkgPath:     pkgPath,
-					definitions: []string{},
+			if decl, ok := idx.funcDecls[fnKey]; ok {
+				src, err := idx.extractNodeSource(decl, decl.Pos(), decl.End())
+				if err != nil {
+					log.Printf("failed to extract source of %q: %v\n", sym, err)
+					continue
 				}
+				results[pkgPath].definitions = append(results[pkgPath].definitions, src)
+				continue
 			}
-			results[pkgPath].definitions = append(results[pkgPath].definitions, src)
-			found = true
-			break
-		}
 
-		if !found {
+			if genDecl, ok := idx.typeSpecs[funcOrTypeName]; ok {
+				src, err := idx.extractNodeSource(genDecl, genDecl.Pos(), genDecl.End())
+				if err != nil {
+					log.Printf("failed to extract type source of %q: %v\n", sym, err)
+					continue
+				}
+				results[pkgPath].definitions = append(results[pkgPath].definitions, src)
+				continue
+			}
+
 			log.Printf("No matching function or type declaration found for symbol %q\n", sym)
 		}
 	}
@@ -131,34 +141,130 @@ func main() {
 
 	for _, pkgKey := range pkgPaths {
 		out := results[pkgKey]
-		if *formatFlag == "markdown" {
+		switch *formatFlag {
+		case "markdown":
 			fmt.Printf("### %s\n\n", out.pkgPath)
 			fmt.Println("```go")
 			fmt.Printf("package %s\n\n", out.pkgName)
-
-			defLens := len(out.definitions)
 			for i, snippet := range out.definitions {
 				fmt.Println(snippet)
-				if i != defLens-1 {
+				if i != len(out.definitions)-1 {
 					fmt.Println()
 				}
 			}
 			fmt.Println("```")
 			fmt.Println()
-		} else {
+
+		default:
 			fmt.Printf("Package: %s (package %s)\n", out.pkgPath, out.pkgName)
 			fmt.Println("--------------------------------------------------")
 			fmt.Printf("package %s\n\n", out.pkgName)
-			defLens := len(out.definitions)
 			for i, snippet := range out.definitions {
 				fmt.Println(snippet)
-				if i != defLens-1 {
+				if i != len(out.definitions)-1 {
 					fmt.Println()
 				}
 			}
 			fmt.Println("--------------------------------------------------")
 			fmt.Println()
 		}
+	}
+}
+
+func buildPackageIndex(pkg *packages.Package) *packageIndex {
+	idx := &packageIndex{
+		pkg:          pkg,
+		fset:         pkg.Fset,
+		fileContents: make(map[string][]byte),
+		funcDecls:    make(map[functionKey]*ast.FuncDecl),
+		typeSpecs:    make(map[string]*ast.GenDecl),
+	}
+
+	for _, fAST := range pkg.Syntax {
+		for _, d := range fAST.Decls {
+			switch decl := d.(type) {
+			case *ast.FuncDecl:
+				name := decl.Name.Name
+				var recvType string
+				var isPtr bool
+				if decl.Recv != nil && len(decl.Recv.List) > 0 {
+					recvExpr := decl.Recv.List[0].Type
+					rt, ptr := receiverTypeString(recvExpr)
+					recvType = rt
+					isPtr = ptr
+				}
+				key := functionKey{
+					funcName:     name,
+					receiverType: recvType,
+					isPtr:        isPtr,
+				}
+				idx.funcDecls[key] = decl
+
+			case *ast.GenDecl:
+				if decl.Tok == token.TYPE {
+					for _, sp := range decl.Specs {
+						ts, ok := sp.(*ast.TypeSpec)
+						if !ok {
+							continue
+						}
+						typeName := ts.Name.Name
+						idx.typeSpecs[typeName] = decl
+					}
+				}
+			}
+		}
+	}
+	return idx
+}
+
+func (idx *packageIndex) extractNodeSource(node ast.Node, startPos, endPos token.Pos) (string, error) {
+	filePos := idx.fset.Position(startPos)
+	fileEnd := idx.fset.Position(endPos)
+	filePath := filePos.Filename
+
+	content, err := idx.getFileContent(filePath)
+	if err != nil {
+		return "", err
+	}
+
+	startOffset := filePos.Offset
+	endOffset := fileEnd.Offset
+	if startOffset >= len(content) || endOffset > len(content) {
+		return "", fmt.Errorf("invalid positions: start=%d end=%d len=%d", startOffset, endOffset, len(content))
+	}
+	return string(content[startOffset:endOffset]), nil
+}
+
+func (idx *packageIndex) getFileContent(filePath string) ([]byte, error) {
+	if b, ok := idx.fileContents[filePath]; ok {
+		return b, nil
+	}
+	b, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read file '%s': %w", filePath, err)
+	}
+	idx.fileContents[filePath] = b
+	return b, nil
+}
+
+func receiverTypeString(expr ast.Expr) (string, bool) {
+	switch e := expr.(type) {
+	case *ast.StarExpr:
+		if id, ok := e.X.(*ast.Ident); ok {
+			return id.Name, true
+		}
+		if sel, ok := e.X.(*ast.SelectorExpr); ok {
+			return sel.Sel.Name, true
+		}
+		return "", true
+	case *ast.Ident:
+		return e.Name, false
+	case *ast.SelectorExpr:
+		return e.Sel.Name, false
+	case *ast.ParenExpr:
+		return receiverTypeString(e.X)
+	default:
+		return "", false
 	}
 }
 
@@ -205,7 +311,6 @@ func parseSymbol(symbol string) (pkgPath, receiverType string, isPtr bool, funcO
 		}
 		raw := m[1]
 		funcOrTypeName = m[2]
-
 		isPtr = strings.HasPrefix(symbol, "(*")
 
 		lastDot := strings.LastIndex(raw, ".")
@@ -252,101 +357,4 @@ func loadPackages(dir, importPath string) ([]*packages.Package, error) {
 		return nil, errors.New("no packages found")
 	}
 	return pkgs, nil
-}
-
-func findFuncDecl(pkg *packages.Package, receiverType string, isPtr bool, funcName string) (decl *ast.FuncDecl, filePath string, fset *token.FileSet) {
-	for i, fAST := range pkg.Syntax {
-		fileName := pkg.CompiledGoFiles[i]
-		fset = pkg.Fset
-
-		for _, d := range fAST.Decls {
-			fd, ok := d.(*ast.FuncDecl)
-			if !ok {
-				continue
-			}
-			if fd.Name == nil || fd.Name.Name != funcName {
-				continue
-			}
-			if receiverType == "" {
-				if fd.Recv == nil {
-					return fd, fileName, fset
-				}
-				continue
-			}
-			if fd.Recv == nil || len(fd.Recv.List) == 0 {
-				continue
-			}
-			recvExpr := fd.Recv.List[0].Type
-			if matchReceiverType(recvExpr, receiverType, isPtr) {
-				return fd, fileName, fset
-			}
-		}
-	}
-	return nil, "", nil
-}
-
-func matchReceiverType(expr ast.Expr, typeName string, isPtr bool) bool {
-	switch e := expr.(type) {
-	case *ast.StarExpr:
-		if !isPtr {
-			return false
-		}
-		if id, ok := e.X.(*ast.Ident); ok {
-			return id.Name == typeName
-		}
-		if sel, ok := e.X.(*ast.SelectorExpr); ok {
-			return sel.Sel.Name == typeName
-		}
-		return false
-	case *ast.Ident:
-		if isPtr {
-			return false
-		}
-		return e.Name == typeName
-	case *ast.SelectorExpr:
-		if isPtr {
-			return false
-		}
-		return e.Sel.Name == typeName
-	case *ast.ParenExpr:
-		return matchReceiverType(e.X, typeName, isPtr)
-	}
-	return false
-}
-
-func findTypeSpec(pkg *packages.Package, typeName string) (node ast.Node, filePath string, fset *token.FileSet) {
-	for i, fAST := range pkg.Syntax {
-		fileName := pkg.CompiledGoFiles[i]
-		fset = pkg.Fset
-
-		for _, d := range fAST.Decls {
-			gd, ok := d.(*ast.GenDecl)
-			if !ok || gd.Tok != token.TYPE {
-				continue
-			}
-			for _, sp := range gd.Specs {
-				ts, ok := sp.(*ast.TypeSpec)
-				if !ok {
-					continue
-				}
-				if ts.Name != nil && ts.Name.Name == typeName {
-					return gd, fileName, fset
-				}
-			}
-		}
-	}
-	return nil, "", nil
-}
-
-func extractNodeSource(fset *token.FileSet, filePath string, node ast.Node) (string, error) {
-	srcBytes, err := os.ReadFile(filePath)
-	if err != nil {
-		return "", fmt.Errorf("cannot read file: %w", err)
-	}
-	start := fset.Position(node.Pos()).Offset
-	end := fset.Position(node.End()).Offset
-	if start >= len(srcBytes) || end > len(srcBytes) {
-		return "", fmt.Errorf("invalid positions: start=%d end=%d len=%d", start, end, len(srcBytes))
-	}
-	return string(srcBytes[start:end]), nil
 }

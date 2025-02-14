@@ -23,7 +23,7 @@ go install github.com/kis9a/symbolprint@latest
 ## Example
 
 ```
-$ symbolprint -format=markdown . <<<"$(
+$ symbolprint -format=plain . <<<"$(
   cat <<EOF
 github.com/example/project/pkg.Add
 (*github.com/example/project/pkg.Calc).Add
